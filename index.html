@@ -1199,6 +1199,70 @@ const CvParser = (() => {
   const QUALIFICATION_RE = /Qualifications?\s*:\s*(.+)/i;
   const EMPLOYMENT_RE = /^(.+?)\s+—\s+(.+?)\s+\((\d{4}(?:-\d{2})?)\s*[-–]\s*(Present|\d{4}(?:-\d{2})?)\)\s*$/gim;
 
+  // Real CVs almost never use the strict "Title — Employer (2020-2023)" /
+  // "Qualification: ..." formats above — those only catch CVs that happen
+  // to be written that exact way. These fallbacks are looser, best-effort
+  // heuristics used only when the strict extractors above find nothing,
+  // so a CV that already parses cleanly is never affected by them.
+  const QUALIFICATION_KEYWORDS_RE = /\b(bachelor|b\.?sc\.?|b\.?a\.?|b\.?eng\.?|b\.?tech\.?|b\.?com\.?|master|m\.?sc\.?|m\.?a\.?|mba|ph\.?d\.?|doctorate|honou?rs|diploma|national\s+diploma|postgraduate|post[\s-]graduate|undergraduate|degree|certificate\s+in|higher\s+certificate|associate\s+degree|matric|grade\s*12|gcse|gce\b|a[\s-]level|o[\s-]level|ordinary\s+level|advanced\s+level|ib\s+diploma|high\s+school)\b/i;
+  const QUALIFICATION_HEADER_STOPWORDS = new Set(["awards and honours", "honours and awards", "education", "qualifications", "academic record", "academic history"]);
+  const EMPLOYMENT_DATE_LINE_RE = /^((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4}|\d{4})\s*[-–—to]{1,3}\s*((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4}|current|present|now|\d{4})\b/i;
+
+  function extractQualificationsFallback(text){
+    if (!text) return [];
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const out = []; const seen = new Set();
+    for (let i = 0; i < lines.length; i++){
+      const line = lines[i];
+      if (line.length > 120 || !QUALIFICATION_KEYWORDS_RE.test(line)) continue;
+      if (QUALIFICATION_HEADER_STOPWORDS.has(line.toLowerCase())) continue;
+      // Degree titles often wrap onto a short continuation line in a
+      // flattened PDF ("Master of Architecture(Professional),Post" /
+      // "Graduate Degree") — stitch the next line on if it looks like a
+      // continuation, and skip past it so it isn't also matched on its own.
+      let combined = line; let consumedNext = false;
+      const next = lines[i + 1];
+      if (next && next.length < 40 && !/^\d/.test(next) && !/[.:]$/.test(line)){ combined = `${line} ${next}`; consumedNext = true; }
+      const key = combined.toLowerCase();
+      if (!seen.has(key)){ seen.add(key); out.push({ qualification: combined, evidence_snippet: combined }); }
+      if (consumedNext) i++;
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+  function extractEmploymentFallback(text){
+    if (!text) return [];
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const out = [];
+    for (let i = 0; i < lines.length; i++){
+      const m = lines[i].match(EMPLOYMENT_DATE_LINE_RE);
+      if (!m) continue;
+      const descLines = [];
+      let j = i + 1;
+      while (j < lines.length && descLines.length < 2 && !lines[j].startsWith("•") && !EMPLOYMENT_DATE_LINE_RE.test(lines[j])){
+        descLines.push(lines[j]); j++;
+      }
+      if (!descLines.length) continue;
+      // A date range followed by a degree/qualification line is an
+      // education entry, not a job — leave it for the qualifications
+      // extractor rather than mislabelling it as employment.
+      if (QUALIFICATION_KEYWORDS_RE.test(descLines[0])) continue;
+      const combinedDesc = descLines.join(" ");
+      const parenMatch = combinedDesc.match(/^(.+?)\(([^)]+)\)/);
+      let employer, title = null;
+      if (parenMatch){ employer = parenMatch[1].trim().replace(/,\s*$/, ""); title = parenMatch[2].trim(); }
+      else employer = descLines[0];
+      const isCurrent = /current|present|now/i.test(m[2]);
+      out.push({ title, employer, start_date: m[1], end_date: isCurrent ? null : m[2], is_current: isCurrent, responsibilities: null });
+      if (out.length >= 6) break;
+    }
+    // Put current/most-recent-looking roles first, since callers elsewhere
+    // in the app treat employment[0] as "current title/employer".
+    out.sort((a, b) => (b.is_current ? 1 : 0) - (a.is_current ? 1 : 0));
+    return out;
+  }
+
+
   // Name detection is intentionally more forgiving than the other extractors:
   // it's the field recruiters most need filled, and real CVs bury it in all
   // kinds of ways — a "CURRICULUM VITAE" banner above it, an ALL-CAPS header,
@@ -1306,13 +1370,15 @@ const CvParser = (() => {
       fields, exactly like parseCandidateDocument() in the brief. */
   function parseCandidateDocument(rawText){
     rawText = rawText || "";
+    const strictQualifications = extractQualifications(rawText);
+    const strictEmployment = extractEmployment(rawText);
     return {
       raw_text: rawText,
       full_name: guessName(rawText),
       email: (rawText.match(EMAIL_RE) || [null])[0],
       phone: (rawText.match(PHONE_RE) || [null])[0],
-      qualifications: extractQualifications(rawText),
-      employment: extractEmployment(rawText),
+      qualifications: strictQualifications.length ? strictQualifications : extractQualificationsFallback(rawText),
+      employment: strictEmployment.length ? strictEmployment : extractEmploymentFallback(rawText),
       skills: extractSkills(rawText),
       registrations: RegistrationLexicon.detect(rawText),
     };
