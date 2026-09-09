@@ -6819,6 +6819,7 @@ async function importCandidatesFromDocumentFolder(){
 
   let created = 0, skippedExisting = 0, noReadableFile = 0, errors = 0;
   const importedNames = [];
+  const errorDetails = []; // { folder, reason } — so failures are diagnosable, not just a count
 
   for await (const [entryName, entryHandle] of root.entries()){
     if (entryHandle.kind !== "directory") continue; // ignore stray files sitting at the root itself
@@ -6830,7 +6831,11 @@ async function importCandidatesFromDocumentFolder(){
       for await (const [fname, fhandle] of entryHandle.entries()){
         if (fhandle.kind === "file") files.push({ name: fname, handle: fhandle });
       }
-    } catch (e){ errors++; continue; }
+    } catch (e){
+      errors++;
+      errorDetails.push({ folder: folderName, reason: `Couldn't list files in this folder — ${(e && e.message) || (e && e.name) || "unknown error"}. If this folder is inside OneDrive/Google Drive/Dropbox, it may be a "cloud-only" placeholder — open the folder in File Explorer once so it downloads fully, then try importing again.` });
+      continue;
+    }
     if (!files.length){ noReadableFile++; continue; }
 
     // Prefer a file that looks like a CV; fall back to the first file in
@@ -6881,9 +6886,12 @@ async function importCandidatesFromDocumentFolder(){
       if (cvText) await classifyCandidateIntoPools(candidate, cvText);
       created++;
       importedNames.push(candidate.full_name);
-    } catch (e){ errors++; }
+    } catch (e){
+      errors++;
+      errorDetails.push({ folder: folderName, reason: `Read the folder OK, but couldn't save the candidate — ${(e && e.message) || (e && e.name) || "unknown error"}. Likely a Firestore connection issue — check you're still signed in and online, then try again.` });
+    }
   }
-  return { created, skippedExisting, noReadableFile, errors, importedNames };
+  return { created, skippedExisting, noReadableFile, errors, importedNames, errorDetails };
 }
 async function runFolderImport(){
   if (!DocumentStorage.isConnected()){ toast("Connect a folder first.", "bad"); return; }
@@ -6898,7 +6906,12 @@ async function runFolderImport(){
     if (result.skippedExisting) parts.push(`${result.skippedExisting} already on the Roster (skipped)`);
     if (result.noReadableFile) parts.push(`${result.noReadableFile} empty folder${result.noReadableFile === 1 ? "" : "s"} skipped`);
     if (result.errors) parts.push(`${result.errors} couldn't be read`);
-    const summary = parts.length ? parts.join(" · ") : "No subfolders found in that location.";
+    let summary = parts.length ? parts.join(" · ") : "No subfolders found in that location.";
+    if (result.errorDetails && result.errorDetails.length){
+      const detailLines = result.errorDetails.map(d => `• “${d.folder}” — ${d.reason}`).join("\n");
+      summary += `\n\nWhat went wrong:\n${detailLines}`;
+    }
+    if (statusEl) statusEl.style.whiteSpace = "pre-wrap";
     if (statusEl) statusEl.textContent = summary;
     toast(result.created ? `Imported ${result.created} candidate${result.created === 1 ? "" : "s"} from the folder.` : "No new candidates found to import.");
   } catch (e){
