@@ -2721,7 +2721,13 @@ async function recomputeForVacancy(vacancyId){
   if (!vacancy) return [];
   const candidates = (await Store.list("candidates")).filter(c => c.status === "active");
   const results = [];
-  for (const c of candidates) results.push(await computeAndStoreMatch(c, vacancy));
+  for (const c of candidates){
+    // One malformed candidate record must never take down scoring for every
+    // other candidate against this vacancy — isolate each calculation so a
+    // single bad pair is skipped (and logged) instead of aborting the batch.
+    try { results.push(await computeAndStoreMatch(c, vacancy)); }
+    catch (e){ console.error(`Match calculation failed for candidate "${c.full_name || c.id}" against vacancy "${vacancy.title || vacancy.id}":`, e); }
+  }
   results.sort((a, b) => b.ai_score - a.ai_score);
   return results;
 }
@@ -2730,7 +2736,14 @@ async function recomputeForCandidate(candidateId){
   if (!candidate) return [];
   const vacancies = (await Store.list("vacancies")).filter(v => v.status === "active");
   const results = [];
-  for (const v of vacancies) results.push(await computeAndStoreMatch(candidate, v));
+  for (const v of vacancies){
+    // Same isolation as above, in the other direction: one vacancy that
+    // trips up the scorer shouldn't zero out every other vacancy's score
+    // for this candidate, and shouldn't make "Add candidate" report a
+    // false failure when the candidate record itself saved just fine.
+    try { results.push(await computeAndStoreMatch(candidate, v)); }
+    catch (e){ console.error(`Match calculation failed for candidate "${candidate.full_name || candidate.id}" against vacancy "${v.title || v.id}":`, e); }
+  }
   results.sort((a, b) => b.ai_score - a.ai_score);
   return results;
 }
@@ -3335,7 +3348,18 @@ function openModal(html, opts){
   const wrap = document.createElement("div");
   wrap.className = "modal-backdrop";
   wrap.id = "modal-backdrop";
-  wrap.onclick = (e) => { if (e.target === wrap && !(opts && opts.persistent)) closeModal(); };
+  wrap.onclick = (e) => {
+    if (e.target !== wrap || (opts && opts.persistent)) return;
+    // A stray click on the backdrop (easy to trigger by accident, and a
+    // known quirk right after the native file-picker dialog closes) used
+    // to silently discard everything typed into the form with zero
+    // warning. Now, if this modal is tracking unsaved changes (the
+    // "● Unsaved changes" indicator wired up via markFormDirty), closing
+    // requires confirmation instead of just vanishing.
+    const dirty = wrap.querySelector('[data-state="dirty"]');
+    if (dirty && !window.confirm("You have unsaved changes in this form. Close without saving?")) return;
+    closeModal();
+  };
   wrap.innerHTML = `<div class="modal">${html}</div>`;
   document.body.appendChild(wrap);
 }
@@ -3343,8 +3367,20 @@ function closeModal(){
   const el = document.getElementById("modal-backdrop");
   if (el) el.remove();
 }
+/** Same close as closeModal(), but asks first if the open modal has
+    unsaved changes — used by the "✕" button and "Cancel" so a stray click
+    there can't silently discard a filled-in Add/Edit Candidate form the
+    way a plain closeModal() call would. closeModal() itself is left alone
+    for every other caller (successful-save auto-close, openModal's own
+    internal cleanup, etc.), which should always close immediately. */
+function requestCloseModal(){
+  const wrap = document.getElementById("modal-backdrop");
+  const dirty = wrap && wrap.querySelector('[data-state="dirty"]');
+  if (dirty && !window.confirm("You have unsaved changes in this form. Close without saving?")) return;
+  closeModal();
+}
 function modalHead(title){
-  return `<div class="modal-head"><h2 style="font-size:18px;">${title}</h2><button class="modal-close" onclick="closeModal()">✕</button></div>`;
+  return `<div class="modal-head"><h2 style="font-size:18px;">${title}</h2><button class="modal-close" onclick="requestCloseModal()">✕</button></div>`;
 }
 /** Wired to every field in the Add/Edit Candidate forms via oninput/onchange
     so the recruiter always knows, at a glance, whether what's on screen has
@@ -3637,7 +3673,7 @@ async function openNewVacancyModal(){
     <div class="modal-head" style="border-top:1px solid var(--line);border-bottom:none;justify-content:space-between;align-items:center;gap:8px;">
       <span id="nv-save-status" class="dek">&nbsp;</span>
       <div style="display:flex;gap:8px;">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" onclick="requestCloseModal()">Cancel</button>
         <button class="btn primary" id="nv-submit-btn" onclick="submitNewVacancy()">Create vacancy</button>
       </div>
     </div>
@@ -3759,7 +3795,7 @@ async function openEditVacancyModal(id){
     <div class="modal-head" style="border-top:1px solid var(--line);border-bottom:none;justify-content:space-between;align-items:center;gap:8px;">
       <span id="ev-save-status" class="dek">&nbsp;</span>
       <div style="display:flex;gap:8px;">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" onclick="requestCloseModal()">Cancel</button>
         <button class="btn primary" id="ev-submit-btn" onclick="submitEditVacancy('${id}')">Save changes</button>
       </div>
     </div>
@@ -4182,7 +4218,7 @@ function openNewCandidateModal(){
     <div class="modal-head" style="border-top:1px solid var(--line);border-bottom:none;justify-content:space-between;align-items:center;gap:8px;">
       <span id="nc-save-status" class="dek">&nbsp;</span>
       <div style="display:flex;gap:8px;">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" onclick="requestCloseModal()">Cancel</button>
         <button class="btn primary" id="nc-submit" onclick="submitNewCandidate()">Add candidate</button>
       </div>
     </div>
@@ -4388,7 +4424,7 @@ async function openEditCandidateModal(id){
     <div class="modal-head" style="border-top:1px solid var(--line);border-bottom:none;justify-content:space-between;align-items:center;gap:8px;">
       <span id="ec-save-status" class="dek">&nbsp;</span>
       <div style="display:flex;gap:8px;">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" onclick="requestCloseModal()">Cancel</button>
         <button class="btn primary" id="ec-submit-btn" onclick="submitEditCandidate('${id}')">Save changes</button>
       </div>
     </div>
