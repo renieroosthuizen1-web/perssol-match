@@ -958,7 +958,8 @@ const Engine = (() => {
     const skills = {};
     for (const s of (candidate.skills || [])) skills[s.skill.toLowerCase()] = s;
     const profMap = { basic: 5.0, intermediate: 7.5, advanced: 10.0, expert: 10.0 };
-    const perSkill = [], scores = [];
+    const perSkill = [];
+    let confirmedCt = 0;
     for (const req of techReqs){
       const name = req.label, key = name.toLowerCase();
       let found = skills[key];
@@ -971,15 +972,31 @@ const Engine = (() => {
         detail = detail.charAt(0).toUpperCase() + detail.slice(1);
         if (found.years) detail += `, ${found.years}yrs`;
         perSkill.push({ skill: name, score: s, confidence: "confirmed", tier: req.tier, detail, evidence: found.evidence_snippet || "" });
-        scores.push(s);
+        confirmedCt++;
       } else {
         perSkill.push({ skill: name, score: null, confidence: "unknown", tier: req.tier, detail: "Not confirmed from CV", evidence: "" });
-        scores.push(6.0);
       }
     }
-    const avg = Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10;
-    const confirmedCt = perSkill.filter(p => p.confidence === "confirmed").length;
-    const comment = `${confirmedCt} of ${techReqs.length} required skills confirmed on CV; the remainder are not confirmed, not assumed absent.`;
+    // "Not confirmed on the CV ≠ definitely absent" is a fair benefit of
+    // the doubt for a candidate who's already shown real overlap with
+    // this skill set — CVs are never exhaustive. It stops being a fair
+    // assumption when NONE of the required skills are confirmed: that
+    // isn't an incomplete CV, it's a strong signal the candidate's
+    // background is in a different field altogether, and the score needs
+    // to reflect that plainly rather than defaulting to a neutral middle.
+    const coverage = confirmedCt / techReqs.length;
+    let avg;
+    if (confirmedCt === 0){
+      avg = 1.5;
+    } else {
+      const confirmedAvg = perSkill.filter(p => p.confidence === "confirmed").reduce((a, p) => a + p.score, 0) / confirmedCt;
+      const unknownWeight = coverage >= 0.5 ? 6.0 : 3.0; // less benefit of the doubt the smaller the confirmed slice is
+      avg = confirmedAvg * coverage + unknownWeight * (1 - coverage);
+    }
+    avg = Math.round(avg * 10) / 10;
+    const comment = confirmedCt === 0
+      ? `None of the ${techReqs.length} required technical/software skill(s) were found anywhere on this candidate's CV — their background does not show evidence of this specific skillset.`
+      : `${confirmedCt} of ${techReqs.length} required skills confirmed on CV; the remainder are not confirmed, not assumed absent.`;
     return { score: avg, confidence: confirmedCt ? "confirmed" : "unknown", comment, evidence: [], per_skill: perSkill };
   }
 
@@ -1092,10 +1109,30 @@ const Engine = (() => {
     const weights = weightsDict(vacancy);
     let overall = 0;
     for (const c in weights) overall += (categoryResults[c] ? categoryResults[c].score : 0) * (weights[c] / 100.0);
+
+    // Safeguard against "death by generous defaults": Location, Experience,
+    // Qualifications, Registration and Seniority all measure something
+    // real about a candidate, but none of them are actually field-specific
+    // — a candidate can score reasonably on every one of those while being
+    // in a completely unrelated profession. Technical Skills is normally
+    // the category that catches that, but on its own it's usually only
+    // 10% of the total weight — not enough to outweigh four or five other
+    // categories defaulting to a comfortable middle score at once. So: if
+    // this vacancy has real technical/software requirements and the
+    // candidate's CV shows confirmed evidence for literally none of them,
+    // that's treated as a hard signal of a field mismatch, and the overall
+    // score is capped into "Low Match" territory regardless of how well
+    // the domain-agnostic categories happened to score.
+    const tech = categoryResults.technical;
+    const hasTechReqs = (vacancy.requirements || []).some(r => r.category === "technical_skill" || r.category === "software");
+    const domainMismatch = hasTechReqs && (tech.per_skill || []).length > 0 && (tech.per_skill || []).every(p => p.confidence === "unknown");
+    if (domainMismatch) overall = Math.min(overall, 4.5);
+
     overall = Math.round(Math.max(0, Math.min(10, overall)) * 10) / 10;
     const interpretation = Weights.interpret(overall);
     const mandatoryChecks = buildMandatoryChecks(vacancy, candidate, categoryResults);
     const ai = AI.analyse(candidate, vacancy, { overall_score: overall, categories: categoryResults, mandatory_checks: mandatoryChecks });
+    if (domainMismatch) ai.gaps.unshift(`None of this role's required technical/software skills were found anywhere on the candidate's CV — this looks like a different field of work entirely, so the overall score has been capped to reflect that rather than averaging it away.`);
     return {
       candidate_id: candidate.id, vacancy_id: vacancy.id,
       ai_score: overall, interpretation,
