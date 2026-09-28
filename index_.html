@@ -587,9 +587,12 @@ const TextMatch = (() => {
     for (const t of req) if (cand.has(t)) hit++;
     return hit / req.size;
   }
+  function normalizeSpacing(s){
+    return (s || "").toLowerCase().replace(/\s*\/\s*/g, "/").replace(/\s+/g, " ").trim();
+  }
   function containsPhrase(haystack, needle){
     if (!haystack || !needle) return false;
-    return haystack.toLowerCase().includes(needle.trim().toLowerCase());
+    return normalizeSpacing(haystack).includes(normalizeSpacing(needle.trim()));
   }
   const LEVEL_PATTERNS = [
     [6, [/\bphd\b/, /\bdoctorate\b/, /\bdphil\b/]],
@@ -768,6 +771,34 @@ const Engine = (() => {
     const kws = ["lead","manager","management","head of","director","senior","principal","supervisor","leadership"];
     const low = text.toLowerCase();
     return kws.some(k => low.includes(k));
+  }
+
+  // Full CV text for a candidate, used when a requirement needs to be
+  // checked directly against what the CV actually says rather than only
+  // against the small fixed MASTER_SKILLS list (see findPhraseEvidence).
+  function candidateCvText(candidate){
+    const docs = ((candidate && candidate.documents) || []).filter(d => d && (d.raw_text || "").trim());
+    if (docs.length) return docs.map(d => d.raw_text).join("\n\n");
+    return (candidate && candidate.raw_text) || "";
+  }
+  // Looks for a requirement's own label/phrase directly in the candidate's
+  // CV text (tolerant of whitespace variation around slashes, e.g.
+  // "WSP/ATR" vs "WSP/ ATR"). This exists because a vacancy's "Technical /
+  // Software" requirements are free text a recruiter types in — they are
+  // often real domain terms (e.g. "WSP/ATR", "grants", "levies" for an HR
+  // role) rather than a software product name, and would never appear in
+  // the fixed MASTER_SKILLS lexicon no matter how well the candidate fits.
+  function findPhraseEvidence(text, phrase){
+    if (!text || !phrase || !phrase.trim()) return null;
+    const esc = phrase.trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\\\//g, "\\s*/\\s*")
+      .replace(/\s+/g, "\\s+");
+    let m;
+    try { m = new RegExp(esc, "i").exec(text); } catch (e){ m = null; }
+    if (!m) return null;
+    const idx = m.index;
+    return text.slice(Math.max(0, idx - 40), idx + m[0].length + 40).trim();
   }
 
   // ---- category 01: location ----
@@ -958,6 +989,7 @@ const Engine = (() => {
     const skills = {};
     for (const s of (candidate.skills || [])) skills[s.skill.toLowerCase()] = s;
     const profMap = { basic: 5.0, intermediate: 7.5, advanced: 10.0, expert: 10.0 };
+    const cvText = candidateCvText(candidate);
     const perSkill = [];
     let confirmedCt = 0;
     for (const req of techReqs){
@@ -972,6 +1004,17 @@ const Engine = (() => {
         detail = detail.charAt(0).toUpperCase() + detail.slice(1);
         if (found.years) detail += `, ${found.years}yrs`;
         perSkill.push({ skill: name, score: s, confidence: "confirmed", tier: req.tier, detail, evidence: found.evidence_snippet || "" });
+        confirmedCt++;
+        continue;
+      }
+      // Not in the structured skills list — before giving up, check whether
+      // the requirement's own wording appears directly on the CV. Many
+      // requirements (HR/compliance terms, industry-specific processes,
+      // internal system names) are real and confirmable but were never
+      // going to be in the small fixed MASTER_SKILLS lexicon.
+      const textEvidence = findPhraseEvidence(cvText, name);
+      if (textEvidence){
+        perSkill.push({ skill: name, score: 7.0, confidence: "confirmed", tier: req.tier, detail: "Mentioned on CV", evidence: textEvidence });
         confirmedCt++;
       } else {
         perSkill.push({ skill: name, score: null, confidence: "unknown", tier: req.tier, detail: "Not confirmed from CV", evidence: "" });
