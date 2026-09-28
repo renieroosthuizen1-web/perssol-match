@@ -425,6 +425,20 @@ function nowIso(){ return new Date().toISOString(); }
 function newId(prefix){
   return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
+// Firestore rejects any field whose value is `undefined` (it must be
+// `null` or simply omitted) and throws on the whole write, not just that
+// field. Since match/candidate/vacancy records have many optional nested
+// fields, this recursively converts undefined -> null right before a
+// write, so one missing field can never take down an entire save again.
+function stripUndefinedDeep(value){
+  if (Array.isArray(value)) return value.map(stripUndefinedDeep);
+  if (value && typeof value === "object" && !(value instanceof Date)){
+    const out = {};
+    for (const k in value) out[k] = value[k] === undefined ? null : stripUndefinedDeep(value[k]);
+    return out;
+  }
+  return value;
+}
 function toast(message, tone){
   const wrap = document.getElementById("toast-wrap");
   const el = document.createElement("div");
@@ -1135,7 +1149,7 @@ const Engine = (() => {
     for (const req of (vacancy.requirements || [])){
       if (req.tier !== "mandatory") continue;
       const [result, evidence] = evaluateMandatory(req, candidate, categoryResults);
-      checks.push({ requirement_id: req.id, label: req.label, category: req.category, result, evidence });
+      checks.push({ requirement_id: req.id || null, label: req.label, category: req.category, result, evidence: evidence == null ? "" : evidence });
     }
     return checks;
   }
@@ -2793,7 +2807,7 @@ async function computeAndStoreMatch(candidate, vacancy){
     result.overridden_by = existing.overridden_by;
     result.overridden_at = existing.overridden_at;
   }
-  await Store.set("matches", id, result);
+  await Store.set("matches", id, stripUndefinedDeep(result));
   return result;
 }
 async function recomputeForVacancy(vacancyId){
@@ -3009,7 +3023,7 @@ async function seedLinkedInDemoImport(){
    once — see seedIfNeeded() below — so re-opening the page never
    duplicates data, and anything a recruiter adds afterwards is safe.
    --------------------------------------------------------------------- */
-function req(category, label, tier, min_years){ return { category, label, tier, min_years: min_years || null }; }
+function req(category, label, tier, min_years){ return { id: newId("req"), category, label, tier, min_years: min_years || null }; }
 
 function buildDemoVacancies(clientIds){
   return [
