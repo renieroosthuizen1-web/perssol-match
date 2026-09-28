@@ -4652,6 +4652,11 @@ async function renderDocumentsSection(c){
       </div>
       ${groupBlocks.join("")}
       <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px;">
+        <div class="field" style="max-width:280px;margin-bottom:10px;">
+          <label>Job title</label>
+          <input id="doc-upload-title-${c.id}" type="text" placeholder="e.g. Senior Architect" value="${escapeHtml(c.current_title || "")}"/>
+          <div class="dek" style="margin-top:2px;">Confirm or update while you're here — uploading a CV alone doesn't change this field on its own.</div>
+        </div>
         <select id="doc-upload-type-${c.id}" class="btn small" style="width:auto;">${typeOptions}</select>
         <input id="cv-upload-${c.id}" type="file" accept=".txt,.pdf,.docx,.md" style="margin-left:8px;"/>
         <button class="btn primary small" style="margin-left:8px;" onclick="handleCvUpload('${c.id}')">Upload document</button>
@@ -5075,6 +5080,7 @@ async function handleCvUpload(candidateId){
   const fileInput = document.getElementById(`cv-upload-${candidateId}`);
   const statusEl = document.getElementById(`cv-upload-status-${candidateId}`);
   const typeSel = document.getElementById(`doc-upload-type-${candidateId}`);
+  const titleInput = document.getElementById(`doc-upload-title-${candidateId}`);
   const docType = (typeSel && typeSel.value) || "cv";
   const docLabel = DOC_TYPE_LABELS[docType] || "Document";
   if (!fileInput.files || !fileInput.files[0]){ statusEl.textContent = "Choose a file first."; return; }
@@ -5083,6 +5089,12 @@ async function handleCvUpload(candidateId){
   try {
     const candidate = await Store.get("candidates", candidateId);
     candidate.documents = candidate.documents || [];
+    // Job title has no auto-fill path of its own here (a re-uploaded CV
+    // updates qualifications/employment/skills, but never touches this
+    // field on its own) — so whatever's in the box is taken as the
+    // recruiter's explicit, current answer and saved every time, CV or not.
+    const typedTitle = titleInput ? titleInput.value.trim() : "";
+    if (typedTitle !== (candidate.current_title || "")) candidate.current_title = typedTitle || null;
     // File the raw document first and independently of text extraction — a
     // corrupt or unusual file must never cost the candidate their document,
     // even if parsing it for auto-fill throws.
