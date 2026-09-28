@@ -425,6 +425,20 @@ function nowIso(){ return new Date().toISOString(); }
 function newId(prefix){
   return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
+// Firestore rejects any field whose value is `undefined` (it must be
+// `null` or simply omitted) and throws on the whole write, not just that
+// field. Since match/candidate/vacancy records have many optional nested
+// fields, this recursively converts undefined -> null right before a
+// write, so one missing field can never take down an entire save again.
+function stripUndefinedDeep(value){
+  if (Array.isArray(value)) return value.map(stripUndefinedDeep);
+  if (value && typeof value === "object" && !(value instanceof Date)){
+    const out = {};
+    for (const k in value) out[k] = value[k] === undefined ? null : stripUndefinedDeep(value[k]);
+    return out;
+  }
+  return value;
+}
 function toast(message, tone){
   const wrap = document.getElementById("toast-wrap");
   const el = document.createElement("div");
@@ -587,9 +601,12 @@ const TextMatch = (() => {
     for (const t of req) if (cand.has(t)) hit++;
     return hit / req.size;
   }
+  function normalizeSpacing(s){
+    return (s || "").toLowerCase().replace(/\s*\/\s*/g, "/").replace(/\s+/g, " ").trim();
+  }
   function containsPhrase(haystack, needle){
     if (!haystack || !needle) return false;
-    return haystack.toLowerCase().includes(needle.trim().toLowerCase());
+    return normalizeSpacing(haystack).includes(normalizeSpacing(needle.trim()));
   }
   const LEVEL_PATTERNS = [
     [6, [/\bphd\b/, /\bdoctorate\b/, /\bdphil\b/]],
@@ -768,6 +785,34 @@ const Engine = (() => {
     const kws = ["lead","manager","management","head of","director","senior","principal","supervisor","leadership"];
     const low = text.toLowerCase();
     return kws.some(k => low.includes(k));
+  }
+
+  // Full CV text for a candidate, used when a requirement needs to be
+  // checked directly against what the CV actually says rather than only
+  // against the small fixed MASTER_SKILLS list (see findPhraseEvidence).
+  function candidateCvText(candidate){
+    const docs = ((candidate && candidate.documents) || []).filter(d => d && (d.raw_text || "").trim());
+    if (docs.length) return docs.map(d => d.raw_text).join("\n\n");
+    return (candidate && candidate.raw_text) || "";
+  }
+  // Looks for a requirement's own label/phrase directly in the candidate's
+  // CV text (tolerant of whitespace variation around slashes, e.g.
+  // "WSP/ATR" vs "WSP/ ATR"). This exists because a vacancy's "Technical /
+  // Software" requirements are free text a recruiter types in — they are
+  // often real domain terms (e.g. "WSP/ATR", "grants", "levies" for an HR
+  // role) rather than a software product name, and would never appear in
+  // the fixed MASTER_SKILLS lexicon no matter how well the candidate fits.
+  function findPhraseEvidence(text, phrase){
+    if (!text || !phrase || !phrase.trim()) return null;
+    const esc = phrase.trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\\\//g, "\\s*/\\s*")
+      .replace(/\s+/g, "\\s+");
+    let m;
+    try { m = new RegExp(esc, "i").exec(text); } catch (e){ m = null; }
+    if (!m) return null;
+    const idx = m.index;
+    return text.slice(Math.max(0, idx - 40), idx + m[0].length + 40).trim();
   }
 
   // ---- category 01: location ----
@@ -958,6 +1003,7 @@ const Engine = (() => {
     const skills = {};
     for (const s of (candidate.skills || [])) skills[s.skill.toLowerCase()] = s;
     const profMap = { basic: 5.0, intermediate: 7.5, advanced: 10.0, expert: 10.0 };
+    const cvText = candidateCvText(candidate);
     const perSkill = [];
     let confirmedCt = 0;
     for (const req of techReqs){
@@ -972,6 +1018,17 @@ const Engine = (() => {
         detail = detail.charAt(0).toUpperCase() + detail.slice(1);
         if (found.years) detail += `, ${found.years}yrs`;
         perSkill.push({ skill: name, score: s, confidence: "confirmed", tier: req.tier, detail, evidence: found.evidence_snippet || "" });
+        confirmedCt++;
+        continue;
+      }
+      // Not in the structured skills list — before giving up, check whether
+      // the requirement's own wording appears directly on the CV. Many
+      // requirements (HR/compliance terms, industry-specific processes,
+      // internal system names) are real and confirmable but were never
+      // going to be in the small fixed MASTER_SKILLS lexicon.
+      const textEvidence = findPhraseEvidence(cvText, name);
+      if (textEvidence){
+        perSkill.push({ skill: name, score: 7.0, confidence: "confirmed", tier: req.tier, detail: "Mentioned on CV", evidence: textEvidence });
         confirmedCt++;
       } else {
         perSkill.push({ skill: name, score: null, confidence: "unknown", tier: req.tier, detail: "Not confirmed from CV", evidence: "" });
@@ -1092,7 +1149,7 @@ const Engine = (() => {
     for (const req of (vacancy.requirements || [])){
       if (req.tier !== "mandatory") continue;
       const [result, evidence] = evaluateMandatory(req, candidate, categoryResults);
-      checks.push({ requirement_id: req.id, label: req.label, category: req.category, result, evidence });
+      checks.push({ requirement_id: req.id || null, label: req.label, category: req.category, result, evidence: evidence == null ? "" : evidence });
     }
     return checks;
   }
@@ -2750,7 +2807,7 @@ async function computeAndStoreMatch(candidate, vacancy){
     result.overridden_by = existing.overridden_by;
     result.overridden_at = existing.overridden_at;
   }
-  await Store.set("matches", id, result);
+  await Store.set("matches", id, stripUndefinedDeep(result));
   return result;
 }
 async function recomputeForVacancy(vacancyId){
@@ -2966,7 +3023,7 @@ async function seedLinkedInDemoImport(){
    once — see seedIfNeeded() below — so re-opening the page never
    duplicates data, and anything a recruiter adds afterwards is safe.
    --------------------------------------------------------------------- */
-function req(category, label, tier, min_years){ return { category, label, tier, min_years: min_years || null }; }
+function req(category, label, tier, min_years){ return { id: newId("req"), category, label, tier, min_years: min_years || null }; }
 
 function buildDemoVacancies(clientIds){
   return [
@@ -4652,6 +4709,11 @@ async function renderDocumentsSection(c){
       </div>
       ${groupBlocks.join("")}
       <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px;">
+        <div class="field" style="max-width:280px;margin-bottom:10px;">
+          <label>Job title</label>
+          <input id="doc-upload-title-${c.id}" type="text" placeholder="e.g. Senior Architect" value="${escapeHtml(c.current_title || "")}"/>
+          <div class="dek" style="margin-top:2px;">Confirm or update while you're here — uploading a CV alone doesn't change this field on its own.</div>
+        </div>
         <select id="doc-upload-type-${c.id}" class="btn small" style="width:auto;">${typeOptions}</select>
         <input id="cv-upload-${c.id}" type="file" accept=".txt,.pdf,.docx,.md" style="margin-left:8px;"/>
         <button class="btn primary small" style="margin-left:8px;" onclick="handleCvUpload('${c.id}')">Upload document</button>
@@ -5075,6 +5137,7 @@ async function handleCvUpload(candidateId){
   const fileInput = document.getElementById(`cv-upload-${candidateId}`);
   const statusEl = document.getElementById(`cv-upload-status-${candidateId}`);
   const typeSel = document.getElementById(`doc-upload-type-${candidateId}`);
+  const titleInput = document.getElementById(`doc-upload-title-${candidateId}`);
   const docType = (typeSel && typeSel.value) || "cv";
   const docLabel = DOC_TYPE_LABELS[docType] || "Document";
   if (!fileInput.files || !fileInput.files[0]){ statusEl.textContent = "Choose a file first."; return; }
@@ -5083,6 +5146,12 @@ async function handleCvUpload(candidateId){
   try {
     const candidate = await Store.get("candidates", candidateId);
     candidate.documents = candidate.documents || [];
+    // Job title has no auto-fill path of its own here (a re-uploaded CV
+    // updates qualifications/employment/skills, but never touches this
+    // field on its own) — so whatever's in the box is taken as the
+    // recruiter's explicit, current answer and saved every time, CV or not.
+    const typedTitle = titleInput ? titleInput.value.trim() : "";
+    if (typedTitle !== (candidate.current_title || "")) candidate.current_title = typedTitle || null;
     // File the raw document first and independently of text extraction — a
     // corrupt or unusual file must never cost the candidate their document,
     // even if parsing it for auto-fill throws.
