@@ -815,6 +815,61 @@ const Engine = (() => {
     return text.slice(Math.max(0, idx - 40), idx + m[0].length + 40).trim();
   }
 
+  // General professional-field backstop. The domain-mismatch check above
+  // only fires when a vacancy has explicit "Technical / Software"
+  // requirements entered AND none are confirmed — so a vacancy that was
+  // set up with a thin or empty Requirements list gets no protection at
+  // all, and every category quietly defaults to a neutral "unknown" score
+  // for every candidate regardless of field. This is a second, independent
+  // safety net: it classifies both the candidate's career and the
+  // vacancy into a broad professional field from their own free text (job
+  // titles, CV content, vacancy title/description) — not dependent on the
+  // recruiter having filled in every requirement row — and caps the score
+  // when the two land in two different, unrelated fields. It only fires on
+  // a confident read of both sides, and it's a backstop, not the primary
+  // signal: a well-specified vacancy is still scored mainly on its actual
+  // Requirements list.
+  const FIELD_LEXICONS = {
+    "IT / Software / DevOps": ["devops","kubernetes","docker","terraform","ansible","ci/cd","cicd","aws","azure cloud",
+      "cloud engineer","linux administ","sysadmin","systems engineer","software developer","software engineer",
+      "programmer","site reliability","sre ","network engineer","database administrator","dba ","cybersecurity",
+      "full stack","backend developer","frontend developer","it support","helpdesk","help desk","python developer",
+      "java developer","gitlab ci","jenkins","git repository","infrastructure as code"],
+    "Human Resources": ["human resource","hr manager","hr business partner","recruitment and selection","talent acquisition",
+      "employee relations","industrial relations","ccma","labour relations","payroll administr","bbbee",
+      "employment equity","organisational development","training and development","hr officer","hr generalist",
+      "wsp/atr","skills development facilitator"],
+    "Architecture / Design": ["architect","sacap","revit","architectural technology","interior design","pr.arch",
+      "candidate architect","architectural draughtsman","architectural design"],
+    "Construction / Civil Engineering": ["civil engineer","quantity surveyor","construction manager","site agent",
+      "construction project manager","ecsa","pr.eng","site engineer","structural engineer","construction management"],
+    "Finance / Accounting": ["bookkeeper","bookkeeping","accountant","accounting officer","saipa","saica","cima",
+      "financial manager","credit controller","tax practitioner","auditor","management accounts"],
+    "Mining / Health & Safety": ["mine health and safety","saiosh","samtrac","safety officer","she officer",
+      "mining engineer","safety compliance officer","incident investigation"],
+  };
+  function classifyField(text){
+    if (!text) return null;
+    const low = text.toLowerCase();
+    let best = null, bestHits = 0;
+    for (const field in FIELD_LEXICONS){
+      let hits = 0;
+      for (const kw of FIELD_LEXICONS[field]) if (low.includes(kw)) hits++;
+      if (hits > bestHits){ bestHits = hits; best = field; }
+    }
+    // Require at least two distinct signal terms before trusting the
+    // classification — a single incidental word is not a confident read.
+    return bestHits >= 2 ? best : null;
+  }
+  function candidateFieldText(candidate){
+    const quals = (candidate.qualifications || []).map(q => [q.qualification, q.field].filter(Boolean).join(" ")).join(" ");
+    return [candidate.current_title || "", quals, candidateCvText(candidate)].join(" ");
+  }
+  function vacancyFieldText(vacancy){
+    const reqLabels = (vacancy.requirements || []).map(r => r.label).join(" ");
+    return [vacancy.title || "", vacancy.description || "", vacancy.industry || "", reqLabels].join(" ");
+  }
+
   // ---- category 01: location ----
   function scoreLocation(candidate, vacancy){
     const candCity = candidate.current_location;
@@ -1185,11 +1240,25 @@ const Engine = (() => {
     const domainMismatch = hasTechReqs && (tech.per_skill || []).length > 0 && (tech.per_skill || []).every(p => p.confidence === "unknown");
     if (domainMismatch) overall = Math.min(overall, 4.5);
 
+    // Second, independent backstop — does NOT depend on this vacancy's
+    // Requirements list being filled in at all. Classifies the candidate's
+    // whole career and the vacancy into a broad professional field from
+    // free text, and caps the score when they land in two clearly
+    // different fields. This catches the case the check above misses
+    // entirely: a vacancy with a thin or empty Requirements list, where
+    // every category quietly defaults to a neutral score for everyone
+    // regardless of how unrelated their background actually is.
+    const candField = classifyField(candidateFieldText(candidate));
+    const vacField = classifyField(vacancyFieldText(vacancy));
+    const fieldMismatch = candField && vacField && candField !== vacField;
+    if (fieldMismatch) overall = Math.min(overall, 4.0);
+
     overall = Math.round(Math.max(0, Math.min(10, overall)) * 10) / 10;
     const interpretation = Weights.interpret(overall);
     const mandatoryChecks = buildMandatoryChecks(vacancy, candidate, categoryResults);
     const ai = AI.analyse(candidate, vacancy, { overall_score: overall, categories: categoryResults, mandatory_checks: mandatoryChecks });
     if (domainMismatch) ai.gaps.unshift(`None of this role's required technical/software skills were found anywhere on the candidate's CV — this looks like a different field of work entirely, so the overall score has been capped to reflect that rather than averaging it away.`);
+    if (fieldMismatch) ai.gaps.unshift(`This candidate's career reads as ${candField}, while this role reads as ${vacField} — a different professional field, so the overall score has been capped accordingly. (Recalculated automatically; add specific Requirements to this vacancy for a more precise score.)`);
     return {
       candidate_id: candidate.id, vacancy_id: vacancy.id,
       ai_score: overall, interpretation,
@@ -4035,11 +4104,12 @@ async function renderVacancyDetail(id, tab){
 }
 
 function renderVacancyOverviewTab(vacancy, contact){
-  const reqRows = (vacancy.requirements || []).map(r => `
+  const reqRows = (vacancy.requirements || []).map((r, idx) => `
     <div class="checklist-row">
       <span class="tag ${r.tier}">${escapeHtml(r.tier)}</span>
       <span style="flex:1;">${escapeHtml(r.label)}${r.min_years ? ` — ${r.min_years}+ yrs` : ""}</span>
       <span class="mono" style="font-size:11px;color:var(--ink-faint);">${escapeHtml(Weights.REQ_CATEGORY_LABELS[r.category] || r.category)}</span>
+      <button class="btn small" style="padding:2px 7px;" title="Remove this requirement" onclick="removeVacancyRequirement('${vacancy.id}', ${idx})">✕</button>
     </div>`).join("") || `<div class="empty">No specific requirements captured.</div>`;
   const weights = vacancy.weights || Weights.DEFAULT;
   const weightRows = Object.keys(Weights.CATEGORY_LABELS).map(cat => `
@@ -4054,6 +4124,14 @@ function renderVacancyOverviewTab(vacancy, contact){
         <h3 style="margin-bottom:4px;">Requirements</h3>
         <p class="dek" style="margin-bottom:10px;">What the Matching Engine checks for. Mandatory items drive the pass/fail checklist on every scorecard.</p>
         ${reqRows}
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line);">
+          <label>Add important skills</label>
+          <div style="display:flex;gap:8px;">
+            <input id="qas-input-${vacancy.id}" type="text" placeholder="e.g. Kubernetes, Docker, AWS, Terraform" style="flex:1;" onkeydown="if(event.key==='Enter'){event.preventDefault();quickAddVacancySkills('${vacancy.id}');}"/>
+            <button class="btn primary" onclick="quickAddVacancySkills('${vacancy.id}')">Add</button>
+          </div>
+          <div class="dek" style="margin-top:4px;">Comma-separated. These are added as "Technical / Software" requirements and every candidate's score recalculates automatically.</div>
+        </div>
         ${vacancy.description ? `<div style="margin-top:14px;"><label>Role Description &amp; Duties/Responsibilities</label><p style="font-size:13px;white-space:pre-wrap;">${escapeHtml(vacancy.description)}</p></div>` : ""}
         <div style="margin-top:14px;max-width:220px;">
           <label>Closing date (optional)</label>
@@ -4138,6 +4216,43 @@ async function saveVacancyWeights(id){
   toast(total === 100 ? "Weights saved — recalculating scores…" : `Weights saved (total ${total}%, doesn't need to be exactly 100) — recalculating…`);
   await recomputeForVacancy(id);
   await auditLog("vacancy", id, "weights_changed", getIdentity(), `Adjusted scoring weights for “${vacancy.title}” and recalculated the Roster.`);
+  router();
+}
+async function quickAddVacancySkills(id){
+  const input = document.getElementById(`qas-input-${id}`);
+  if (!input) return;
+  const raw = input.value.trim();
+  if (!raw){ toast("Type one or more skills first.", "bad"); return; }
+  const vacancy = await Store.get("vacancies", id);
+  if (!vacancy) return;
+  vacancy.requirements = vacancy.requirements || [];
+  const existing = new Set(vacancy.requirements
+    .filter(r => r.category === "technical_skill" || r.category === "software")
+    .map(r => (r.label || "").toLowerCase()));
+  const names = raw.split(",").map(s => s.trim()).filter(Boolean);
+  let added = 0;
+  for (const name of names){
+    if (existing.has(name.toLowerCase())) continue;
+    vacancy.requirements.push(req("technical_skill", name, "important"));
+    existing.add(name.toLowerCase());
+    added++;
+  }
+  if (!added){ toast("Those skills are already listed on this vacancy."); return; }
+  await Store.set("vacancies", id, vacancy);
+  toast(`Added ${added} skill(s) — recalculating scores…`);
+  await recomputeForVacancy(id);
+  await auditLog("vacancy", id, "requirements_changed", getIdentity(), `Added ${added} important skill(s) to “${vacancy.title}” and recalculated the Roster.`);
+  router();
+}
+async function removeVacancyRequirement(id, index){
+  const vacancy = await Store.get("vacancies", id);
+  if (!vacancy || !vacancy.requirements || !vacancy.requirements[index]) return;
+  const removed = vacancy.requirements[index];
+  vacancy.requirements = vacancy.requirements.filter((_, i) => i !== index);
+  await Store.set("vacancies", id, vacancy);
+  toast(`Removed “${removed.label}” — recalculating scores…`);
+  await recomputeForVacancy(id);
+  await auditLog("vacancy", id, "requirements_changed", getIdentity(), `Removed “${removed.label}” from “${vacancy.title}” and recalculated the Roster.`);
   router();
 }
 async function updateVacancyClosingDate(id, value){
